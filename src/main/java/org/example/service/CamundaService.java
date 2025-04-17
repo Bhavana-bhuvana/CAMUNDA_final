@@ -1,10 +1,14 @@
 package org.example.service;
-
-
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.model.Filters;
+import com.mongodb.client.model.Updates;
+import org.bson.Document;
+import org.bson.types.ObjectId;
+import org.example.MongoUtil;
 import org.springframework.stereotype.Service;
 import java.io.BufferedReader;
 import java.io.File;
@@ -13,13 +17,14 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
-import java.util.regex.*;;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
 @Service
 public class CamundaService {
-
-
     public static void startCamundaAndRunDMN() {
         try {
             // Step 1: Start Camunda BPM Run (if not already running)
@@ -81,90 +86,98 @@ public class CamundaService {
             e.printStackTrace();
         }
     }
-    public static JsonObject finalOutput(JsonArray allResponses, JsonArray extractedTests) {
+    public static JsonObject finalOutput(JsonArray allResponses, ObjectId id) {
         JsonArray insights = new JsonArray();
         double totalScore = 0;
         int testCount = 0;
 
-        // Step 1: Extract test names from extractedTests
-        List<String> testNames = new ArrayList<>();
-        for (JsonElement testElement : extractedTests) {
-            JsonObject testObj = testElement.getAsJsonObject().getAsJsonObject("variables");
-            for (Map.Entry<String, JsonElement> entry : testObj.entrySet()) {
-                testNames.add(entry.getKey());  // Store only the test name
-            }
+        MongoCollection<Document> collection = MongoUtil.getDatabase().getCollection("user");
+        Document document = collection.find(Filters.eq("_id", id)).first();
+
+        if (document == null) {
+            throw new RuntimeException("Document not found for ID: " + id.toHexString());
         }
 
-        int testIndex = 0;  // To match extracted test names with responses
+        // Prepare test list with "electrolytes" added twice if present
+        List<String> testList = document.keySet().stream()
+                .filter(key -> !key.equals("_id") && !key.equals("finalResult"))
+                .flatMap(key -> {
+                    if (key.equals("electrolytes")) {
+                        return Stream.of("electrolytes", "electrolytes"); // Add twice
+                    } else {
+                        return Stream.of(key);
+                    }
+                })
+                .collect(Collectors.toList());
 
-        // Step 2: Iterate through allResponses and match risk categories & scores
-        for (int i = 0; i < allResponses.size(); i++) {
-            String responseStr = allResponses.get(i).getAsString();
+        Set<String> validTestKeys = new HashSet<>(testList); // For quick lookup
+
+        // Flatten and iterate through all responses
+        List<JsonObject> allCamundaResults = new ArrayList<>();
+        for (JsonElement resp : allResponses) {
+            String responseStr = resp.getAsString();
             JsonArray responseArray = JsonParser.parseString(responseStr).getAsJsonArray();
 
-            for (int j = 0; j < responseArray.size(); j++) {
-                JsonObject responseObj = responseArray.get(j).getAsJsonObject();
-
-                // Get the corresponding test name
-                String testName = (testIndex < testNames.size()) ? testNames.get(testIndex) : "Unknown Test";
-                testIndex++;
-
-                // Extract risk category
-                String riskCategory = "No Risk Data";
-                if (responseObj.has("risk category")) {
-                    JsonObject riskObj = responseObj.getAsJsonObject("risk category");
-                    riskCategory = riskObj.get("value").getAsString();
-                }
-
-                // Extract test score (from "Scores")
-                int testScore = 0;
-                if (responseObj.has("Scores")) {
-                    JsonObject scoreObj = responseObj.getAsJsonObject("Scores");
-                    testScore = scoreObj.get("value").getAsInt();  // Extract integer value
-                    totalScore += testScore;
-                    testCount++;
-                }
-
-                // Store insight
-                JsonObject insight = new JsonObject();
-                insight.addProperty("test_name", testName);
-                insight.addProperty("risk_category", riskCategory);
-                insight.addProperty("score", testScore); // Include score for each test
-                insights.add(insight);
-
-                // Special handling: If testName is "sodium", check for "potassium"
-                if (testName.equalsIgnoreCase("sodium")) {
-                    boolean potassiumFound = false;
-
-                    // Check if "potassium" is also in the extracted test names
-                    if (testIndex < testNames.size() && testNames.get(testIndex).equalsIgnoreCase("potassium")) {
-                        potassiumFound = true;
-                        testIndex++;  // Move index forward since we are handling potassium here
-                    }
-
-                    // If potassium is not found, add it manually with the same risk category
-                    if (!potassiumFound) {
-                        JsonObject potassiumInsight = new JsonObject();
-                        potassiumInsight.addProperty("test_name", "potassium");
-                        potassiumInsight.addProperty("risk_category", riskCategory);
-                        potassiumInsight.addProperty("score", testScore); // Use same score as sodium
-                        insights.add(potassiumInsight);
-                    }
-                }
+            for (JsonElement element : responseArray) {
+                allCamundaResults.add(element.getAsJsonObject());
             }
         }
 
-        // Step 3: Compute final score
-        double finalScore = (testCount > 0) ? totalScore / testCount : 0;
+        // Match responses with testList by index
+        for (int i = 0; i < Math.min(testList.size(), allCamundaResults.size()); i++) {
+            String testKey = testList.get(i);
+            JsonObject responseObj = allCamundaResults.get(i);
 
-        // Step 4: Construct final JSON output
+            String riskCategory = responseObj.has("risk category")
+                    ? responseObj.getAsJsonObject("risk category").get("value").getAsString()
+                    : "No Risk Data";
+
+            JsonObject scoreObj = null;
+            if (responseObj.has("score")) {
+                scoreObj = responseObj.getAsJsonObject("score");
+            } else if (responseObj.has("Scores")) {
+                scoreObj = responseObj.getAsJsonObject("Scores");
+            }
+
+            if (scoreObj != null) {
+                double score = scoreObj.get("value").getAsDouble();
+                String testName = testKey;
+
+                // Special case for electrolytes → distinguish using risk category
+                if ("electrolytes".equals(testKey)) {
+                    if (riskCategory.toLowerCase().contains("sodium")) {
+                        testName = "sodium";
+                    } else if (riskCategory.toLowerCase().contains("potassium")) {
+                        testName = "potassium";
+                    } else {
+                        testName = "electrolytes"; // fallback if unknown
+                    }
+                }
+
+                JsonObject insight = new JsonObject();
+                insight.addProperty("Test Name", testName);
+                insight.addProperty("Risk Category", riskCategory);
+                insight.addProperty("Score", score);
+                insights.add(insight);
+
+                totalScore += score;
+                testCount++;
+            }
+        }
+
+        double averageScore = testCount > 0 ? totalScore / testCount : 0;
+
         JsonObject finalResult = new JsonObject();
-        finalResult.addProperty("final_score", finalScore);
-        finalResult.add("insights", insights);
+        finalResult.addProperty("Average Score", averageScore);
+        finalResult.add("Insights", insights);
 
-        System.out.println(finalResult.toString());
+        // Save to MongoDB
+        Document finalResultDoc = Document.parse(finalResult.toString());
+        collection.updateOne(Filters.eq("_id", id), Updates.set("finalResult", finalResultDoc));
+
         return finalResult;
     }
+
 
 
 
